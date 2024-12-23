@@ -1,7 +1,7 @@
 from typing import Optional, Tuple
 
 import torch
-
+from vllm import _custom_ops as ops
 
 def normalize_e4m3fn_to_e4m3fnuz(
     weight: torch.Tensor,
@@ -25,3 +25,21 @@ def normalize_e4m3fn_to_e4m3fnuz(
     if input_scale is not None:
         input_scale = input_scale * 2.0
     return weight, weight_scale, input_scale
+
+#Utility function to compute the correct scaling numbers given weight tensor in BF16 or FP16 data type
+def compute_fp8_int4_scaling_numbers(
+        weight: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert weight.dtype in [torch.bfloat16, torch.float16]
+    qfp8weight, fp8weight_scale = ops.scaled_fp8_quant(weight, scale=None)
+    int4_amax = 8
+    bias = 8
+    int4weight_scales = (torch.max(torch.abs(qfp8weight), dim=1, keepdim=True)[0] / int4_amax) 
+    qfp8weight.div_(int4weight_scales)
+    qfp8weight.round_()
+    qfp8weight.add_(bias)
+    qfp8weight.clamp_(-int4_amax + bias, int4_amax -1  + bias) #[0, 15]
+    qfp8weight = qfp8weight.to(torch.uint8)
+    # pack INT4 values into bytes
+    qint4weight = ((qfp8weight[:, ::2] & 0xF) << 4) | (qfp8weight[:, 1::2] & 0xF) 
+    return qint4weight, fp8weight_scale, int4weight_scales
