@@ -43,3 +43,17 @@ def compute_fp8_int4_scaling_numbers(
     # pack INT4 values into bytes
     qint4weight = ((qfp8weight[:, ::2] & 0xF) << 4) | (qfp8weight[:, 1::2] & 0xF) 
     return qint4weight, fp8weight_scale, int4weight_scales
+
+def upcast_int4_weight_into_fp8(
+    qint4weight: torch.Tensor,
+    int4weight_scales: torch.Tensor,
+    fp8weight_scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    M, N = qint4weight.shape
+    bias = 8 #for INT4
+    qfp8weight = torch.zeros((M, 2 * N), dtype=torch.uint8)  
+    qfp8weight[:, 0::2] =  (qint4weight >> 4) & 0xF
+    qfp8weight[:, 1::2] = qint4weight & 0xF
+    qfp8weight.subtract_(bias).to(torch.int8)
+    qfp8weight.mul_(int4weight_scales).to(torch.float8_e4m3fn)
+    return qfp8weight, fp8weight_scale
