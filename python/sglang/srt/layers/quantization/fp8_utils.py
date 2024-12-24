@@ -40,6 +40,7 @@ def compute_fp8_int4_scaling_numbers(
     qfp8weight.add_(bias)
     qfp8weight.clamp_(-int4_amax + bias, int4_amax -1  + bias) #[0, 15]
     qfp8weight = qfp8weight.to(torch.uint8)
+    ###NOTE: need to use torch.uint8 instead of torch.int8; otherwise, for negative numbers, 0xF or <<4 will produce unexpected result or undefined behavior!!
     # pack INT4 values into bytes
     qint4weight = ((qfp8weight[:, ::2] & 0xF) << 4) | (qfp8weight[:, 1::2] & 0xF) 
     return qint4weight, fp8weight_scale, int4weight_scales
@@ -52,6 +53,7 @@ def upcast_int4_weight_into_fp8(
     M, N = qint4weight.shape
     bias = 8 #for INT4
     qfp8weight = torch.zeros((M, 2 * N), dtype=torch.uint8)  
+    ###NOTE: need to use torch.uint8 instead of torch.int8; otherwise, for negative numbers, 0xF or >>4 will produce unexpected result or undefined behavior!!
     qfp8weight[:, 0::2] =  (qint4weight >> 4) & 0xF
     qfp8weight[:, 1::2] = qint4weight & 0xF
     qfp8weight.subtract_(bias).to(torch.int8)
