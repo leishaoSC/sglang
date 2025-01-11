@@ -471,7 +471,7 @@ class Fp8MoEMethod:
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts, 2 * intermediate_size, hidden_size, dtype=params_dtype
+                num_experts, 2 * intermediate_size, int(hidden_size/8), dtype=params_dtype
             ),
             requires_grad=False,
         )
@@ -480,7 +480,7 @@ class Fp8MoEMethod:
 
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts, hidden_size, intermediate_size, dtype=params_dtype
+                num_experts, hidden_size, int(intermediate_size/8), dtype=params_dtype
             ),
             requires_grad=False,
         )
@@ -516,11 +516,19 @@ class Fp8MoEMethod:
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
             )
+            w13_weight_scale_2 = torch.nn.Parameter(
+                torch.ones(num_experts, 2*int(hidden_size/8), dtype=torch.float32), requires_grad=False
+            )
             w2_weight_scale = torch.nn.Parameter(
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
             )
+            w2_weight_scale_2 = torch.nn.Parameter(
+                torch.ones(num_experts, int(intermediate_size/8), dtype=torch.float32), requires_grad=False
+            )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
+            layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
+            layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
         extra_weight_attrs.update(
@@ -533,7 +541,9 @@ class Fp8MoEMethod:
         #   process_weights_after_loading()
         if self.quant_config.is_checkpoint_fp8_serialized:
             set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+            set_weight_attrs(w13_weight_scale_2, extra_weight_attrs)
             set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+            set_weight_attrs(w2_weight_scale_2, extra_weight_attrs)
 
         # INPUT_SCALES
         if self.quant_config.activation_scheme == "static":
