@@ -503,6 +503,7 @@ def _prepare_presharded_weights(
 
     # The new format
     allow_patterns += [f"*-TP-{tp_rank:03d}.safetensors", "*-TP-common.safetensors"]
+    allow_patterns += [f"model-*.safetensors"]
 
     hf_weights_files: List[str] = []
     for pattern in allow_patterns:
