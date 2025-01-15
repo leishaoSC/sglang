@@ -10,6 +10,8 @@ import triton.language as tl
 #This code is adapted from https://github.com/ROCm/vllm/blob/main/vllm/model_executor/layers/quantization/awq_triton.py
 
 #zeros are ignored since we use symmetric quantization
+# qweight is both quantized and bit-packed alone the same row. All the bits in the same row has the same scaling factor.
+# 8 INT4s are packed into one INT32. INT4 instead of UINT4 is used.
 
 ################################################################################
 # Custom Triton Kernel & Wrapper 
@@ -17,7 +19,7 @@ import triton.language as tl
 
 @triton.jit
 def wint4_perchannel_to_fp8_dequantize_kernel(
-    qweight_ptr,    # [K, M//8], each int32 has 8 nibbles,  quantized matrix
+    qweight_ptr,    # [K, M//8], each int32 has 8 nibbles, packed with 8 int4 (not uint4),  quantized matrix
     scales_ptr,     # [K], float32,  scales, per channel
     result_ptr,     # [K, M], FP8,  Output matrix
     BLOCK_SIZE: tl.constexpr,
@@ -42,7 +44,7 @@ def wint4_perchannel_to_fp8_dequantize_kernel(
     # Load the int32 packed 4-bit
     iweights = tl.load(qweight_ptr + offsets, mask=mask_offsets, other=0.0) # (BLOCK_SIZE)
     iweights = tl.reshape(iweights, (P2, 1)) # to handle the cases where BLOCK_SIZE is not power of 2.
-    #iweights = tl.reshape(iweights, (BLOCK_SIZE, 1)) # (BLOCK_SIZE, 1)
+    
     # Expand from int32 -> 8 nibbles with repeated tl.interleave calls
     iweights = tl.interleave(iweights, iweights)     # (BLOCK_SIZE, 1) -> (BLOCK_SIZE, 2)
     iweights = tl.interleave(iweights, iweights)     # (BLOCK_SIZE, 2) -> (BLOCK_SIZE, 4)
@@ -56,31 +58,51 @@ def wint4_perchannel_to_fp8_dequantize_kernel(
 
     # Broadcast shifts
     shifts = shifts + tl.zeros([P2, 8], dtype=shifts.dtype) # to handle the cases where BLOCK_SIZE is not power of 2.
-    #shifts = shifts + tl.zeros([BLOCK_SIZE, 8], dtype=shifts.dtype)
     
     # Extract nibbles
-    iweights = (iweights >> shifts) & 0xF    # (BLOCK_SIZE, 8)
+    iweights = (iweights >> shifts) & 0xF    # (BLOCK_SIZE, 8), this is unsigned [0..15]
+
+    
+    # Sign-extend nibble => range [-8..7], as we use int4 (not uint4)
+    iweights = tl.where(iweights >= 8, iweights - 16, iweights)
+    """
+    0x0..0xF [0..15]
+    
+    int32 --> uint4 --> int4* [7..0..-8]
+    0x0 --> 0           (0)
+    0x1 --> 1
+    .
+    .
+    0x7 --> 7           (7)
+    0x8 --> 8           (-8)
+    ---------
+    0x9 --> 9           (-7)
+    0xA --> 10          (-6) 
+    0xB --> 11
+    0xC --> 12
+    0xD --> 13
+    0xE --> 14
+    0xF --> 15          (-1)
+    """
 
     # Load the per-channel scale (float32)
     scale_offsets = pid
     scales = tl.load(scales_ptr + scale_offsets) # every row (pid) has one float32 (1 element vector)
     scales = scales + tl.zeros([P2, 8], dtype=tl.float32)    # to handle the cases where BLOCK_SIZE is not power of 2.
-    #scales = scales + tl.zeros([BLOCK_SIZE, 8], dtype=tl.float32)    # shape [BLOCK_SIZE, 8]
-
+   
     # Multiply
     iweights = iweights * scales   # symmetric, so no zeros
-    iweights = iweights.to(result_ptr.type.element_ty)
+    iweights = iweights.to(result_ptr.type.element_ty) # Ref: https://github.com/triton-lang/triton/blob/main/python/triton/runtime/jit.py#L409-L410 (tl.float8e4b8)
     
     # Flatten from [BLOCK_SIZE, 8] => [BLOCK_SIZE*8]
     iweights = tl.reshape(iweights, [P2 * 8])  # to handle the cases where BLOCK_SIZE is not power of 2.
-    #iweights = tl.reshape(iweights, [BLOCK_SIZE * 8])
     
     # Store to result
     tl.store(result_ptr + result_offsets, iweights, mask=mask_result)
 
 
 def wint4_perchannel_to_fp8_dequantize_triton(
-    qweight: torch.Tensor,  # [K, M//8], pack 8 INT4s into one int32
+    qweight: torch.Tensor,  # [K, M//8], pack 8 INT4s into one int32 (used int4 instead of uint4)
     weight_scale1: torch.Tensor  # [K], float32, (scaling factor for per-channel INT4)
 ) -> torch.Tensor:
 
@@ -94,7 +116,7 @@ def wint4_perchannel_to_fp8_dequantize_triton(
     # Result tensor:
     # number of rows = same as input tensor
     # number of cols = 8 x input tensor num cols
-    result = torch.zeros((K, M), device=qweight.device, dtype=torch.float8_e4m3fn) 
+    result = torch.zeros((K, M), device=qweight.device, dtype=torch.float8_e4m3fnuz) # Ref: https://github.com/triton-lang/triton/blob/main/python/triton/runtime/jit.py#L409-L410
 
     # Next power of two above M_8
     P2 = triton.next_power_of_2(M_8) # the smallest power of 2 that’s ≥ M_8
@@ -109,7 +131,7 @@ def wint4_perchannel_to_fp8_dequantize_triton(
         weight_scale1,
         result,
         BLOCK_SIZE=M_8,
-        K = K,
+        K=K,
         P2=P2
     )
 
