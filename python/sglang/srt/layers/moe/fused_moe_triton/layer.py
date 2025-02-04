@@ -204,7 +204,6 @@ class FusedMoE(torch.nn.Module):
         prefix: str = "",
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
-        use_presharded_weights: bool = False,
     ):
         super().__init__()
 
@@ -244,7 +243,6 @@ class FusedMoE(torch.nn.Module):
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
         )
-        self.use_presharded_weights = use_presharded_weights
 
     def _load_per_tensor_weight_scale(
         self,
@@ -397,7 +395,10 @@ class FusedMoE(torch.nn.Module):
         weight_name: str,
         shard_id: str,
         expert_id: int,
+        use_presharded_weights: bool = False,
     ) -> None:
+        self.use_presharded_weights = use_presharded_weights
+
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
@@ -435,6 +436,7 @@ class FusedMoE(torch.nn.Module):
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:
             # this is needed for compressed-tensors only
+            loaded_weight = loaded_weight * 2.0
             loaded_weight = loaded_weight.to(param.data.device)
 
             if (
@@ -472,6 +474,9 @@ class FusedMoE(torch.nn.Module):
             # specific to each case
             quant_method = getattr(param, "quant_method", None)
             if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
+                scaled_factor = 0.5
+
+                loaded_weight = loaded_weight * scaled_factor
                 self._load_per_channel_weight_scale(
                     shard_id=shard_id,
                     shard_dim=shard_dim,
@@ -491,6 +496,9 @@ class FusedMoE(torch.nn.Module):
                     tp_rank=tp_rank,
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
+                scaled_factor = 2.0
+                loaded_weight = loaded_weight * scaled_factor
+
                 self._load_per_tensor_weight_scale(
                     shard_id=shard_id,
                     param=param,
