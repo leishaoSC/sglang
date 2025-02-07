@@ -39,34 +39,67 @@ def int4_to_fp8_dequant(
         K8: tl.constexpr, #K/8
         N: tl.constexpr
 ):
-    #tl.device_print("in_qweights", qweights)
-    qweights = qweights.trans(1,0) #(N,K8)
-    qweights = tl.interleave(qweights, qweights)
-    qweights = tl.interleave(qweights, qweights)
-    weights = tl.interleave(qweights, qweights).trans(1,0) #(K,N)
 
+    qweights = qweights.trans(1,0) #(N,K8)
+    #use shifts to extract nibbles instead of using tl.interleave
+    # Extract 8 nibbles per int32 element
+    #reverse_order_tensor: [0, 4, 1, 5, 2, 6, 3, 7]
     reverse_order_tensor = ((tl.arange(0, 2) * 4)[None, :] +
                                 tl.arange(0, 4)[:, None]).reshape(8)
-
-    # Use this to compute a set of shifts that can be used to unpack and
-    # reorder the values in weights
     shifts = reverse_order_tensor * 4
-    shifts = tl.broadcast_to(shifts[None, :], (K8*N, 8)) #(K8*N,8)
-    shifts = tl.reshape(shifts, (N, K8*8)).trans(1,0) #(K,N)
-    #tl.device_print("shifts", shifts)
+    #reorder and extract in the same step!!
+    # Reorder along axis=2, for weights which has shape (N, K8, 8)
+    weights = (qweights[:, :, None] >> shifts[None, :]) & 0xF  # Shape: (N, K8, 8)  
 
-    # Unpack and reorder: shift out the correct 4-bit value and mask.
-    weights = ((weights >> shifts) & 0xF) #(K,N)
-    weights = tl.where(weights >= 8, weights - 16, weights)
+    weights = weights.reshape(N, K8*8).trans(1,0)  #(N, K8, 8) to (N,K) to (K, N)
+    weights = tl.where(weights >= 8, weights - 16, weights) # Sign-extend nibble => range [-8..7]
 
-    #scales = tl.broadcast_to(scales[None, :], (K8*8,N))
     scales = tl.broadcast_to(scales[:], (K8*8,N))
+    #scales = tl.broadcast_to(scales[None, :], (K8*8,N)) #not work in sglang moe code
+    #scales = scales + tl.zeros([K8*8, N], dtype=tl.float32)# works but very slow
+
     #tl.device_print("scales", scales)
     dweights = weights * scales
     dweights = dweights.to(tl.float8e4b8)
-    #tl.device_print("dweights", dweights)
 
     return dweights
+
+################## original implementation below:###########
+# @triton.jit
+# def int4_to_fp8_dequant(
+#         qweights,  # quantized matrix, K/8 x N
+#         scales,  # scales, per channel (N,)
+#         K8: tl.constexpr, #K/8
+#         N: tl.constexpr
+# ):
+#     #tl.device_print("in_qweights", qweights)
+#     qweights = qweights.trans(1,0) #(N,K8)
+#     qweights = tl.interleave(qweights, qweights)
+#     qweights = tl.interleave(qweights, qweights)
+#     weights = tl.interleave(qweights, qweights).trans(1,0) #(K,N)
+
+#     reverse_order_tensor = ((tl.arange(0, 2) * 4)[None, :] +
+#                                 tl.arange(0, 4)[:, None]).reshape(8)
+
+#     # Use this to compute a set of shifts that can be used to unpack and
+#     # reorder the values in weights
+#     shifts = reverse_order_tensor * 4
+#     shifts = tl.broadcast_to(shifts[None, :], (K8*N, 8)) #(K8*N,8)
+#     shifts = tl.reshape(shifts, (N, K8*8)).trans(1,0) #(K,N)
+#     #tl.device_print("shifts", shifts)
+
+#     # Unpack and reorder: shift out the correct 4-bit value and mask.
+#     weights = ((weights >> shifts) & 0xF) #(K,N)
+#     weights = tl.where(weights >= 8, weights - 16, weights)
+
+#     #scales = tl.broadcast_to(scales[None, :], (K8*8,N))
+#     scales = tl.broadcast_to(scales[:], (K8*8,N))
+#     #tl.device_print("scales", scales)
+#     dweights = weights * scales
+#     dweights = dweights.to(tl.float8e4b8)
+#     #tl.device_print("dweights", dweights)
+
+#     return dweights
 
 @triton.jit
 def fused_moe_kernel(
