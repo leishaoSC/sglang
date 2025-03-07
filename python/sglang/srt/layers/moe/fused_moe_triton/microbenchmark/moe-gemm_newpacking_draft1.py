@@ -145,6 +145,14 @@ def torch_int4_to_fp8_dequant(qweights,  # E, N, K/8
 
 #     return dweights
 
+######################################################
+#NOTE: K*8 was used for use_int4 in moe_gemm_kernel calling!!
+#   #moe_gemm_kernel[grid](
+       # a, b, c, a_scale, b_scale, b_scale_int4, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, N,
+       # K * 8 if use_int4 else K
+
+    #for new packing, need to change it to K*2!!
+###################################################
 
 @triton.jit
 def moe_gemm_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, b_scale_int4_ptr, topk_weights_ptr,
@@ -217,7 +225,7 @@ def moe_gemm_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, b_scale_int4_
     if use_int4_w:
         #load 1/2 th elements in B in the K direction, new packing of 2 INT4s to INT8
         b_ptrs = (b_ptr + off_experts * stride_be + ((offs_k[:, None] // 2) * stride_bk + offs_bn[None, :] * stride_bn))
-        b_shifter = (offs_k[:, None] % 2) * 4 #??
+        b_shifter = (offs_k[:, None] % 2) * 4 # [0, 4, 0,4....]
         b_zp_num = 8 # ??
     else:
         #load regular
@@ -239,6 +247,7 @@ def moe_gemm_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, b_scale_int4_
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        #tl.device_print("k", k)
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
         if even_Ks:
@@ -249,11 +258,11 @@ def moe_gemm_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, b_scale_int4_
             )
             if use_int4_w:
                 #size (BLOCK_SIZE_K /2, BLOCK_SIZE_N)
-                b_int4 = tl.full((32,64), 1, tl.int8) #can run, but for debugging only
-                #b_int4 = tl.load(b_ptrs) #caused memory access fault
+                b_int4 = tl.load(b_ptrs) 
                 #b = int4_to_fp8_dequant(b_int4, b_scale_int4, b_int4.shape[0], b_int4.shape[1])
                 #new packing size (BLOCK_SIZE_K /2, BLOCK_SIZE_N)
                 b = (b_int4 >> b_shifter) & 0xF
+                b = tl.where(b >= 8, b - 16, b) #handle negative values
                 #b = ((b.to(tl.float32) - b_zp_num) * b_scale_int4).to(compute_type)#???
                 b = (b * b_scale_int4).to(tl.float8e4b8)
             else:
@@ -270,6 +279,7 @@ def moe_gemm_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, b_scale_int4_
                 #b = int4_to_fp8_dequant(b_int4, b_scale_int4, b_int4.shape[0], b_int4.shape[1])
                 #new packing size (BLOCK_SIZE_K /2, BLOCK_SIZE_N)
                 b = (b_int4 >> b_shifter) & 0xF
+                b = tl.where(b >= 8, b - 16, b) #handle negative values
                 b = (b * b_scale_int4).to(tl.float8e4b8)
                 #b = ((b.to(tl.float32) - b_zp_num) * b_scale_int4).to(compute_type) #???
             else:
@@ -486,10 +496,14 @@ def moe_gemm(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, a_scale: torch.T
 
     use_fp8 = True if a_scale is not None and b_scale is not None else False
     use_int4 = True if b_scale_int4 is not None else False
+    # print("N=", N, "original K=", K, "new K for int4=", K*2)
+    # print("BLOCK_SIZE_K=", config["BLOCK_SIZE_K"], "BLOCK_SIZE_N=", config["BLOCK_SIZE_N"], "BLOCK_SIZE_M=", config["BLOCK_SIZE_M"])
 
+
+    #replaced "K * 8 if use_int4 else K" with "K * 2 if use_int4 else K" for new packing!!!!!!!!!!!!!!!!!!!!!!!!!
     moe_gemm_kernel[grid](
         a, b, c, a_scale, b_scale, b_scale_int4, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, N,
-        K * 8 if use_int4 else K, EM, topk_ids.numel(), a.stride(0), a.stride(1), b.stride(0), b.stride(2), b.stride(1),
+        K * 2 if use_int4 else K, EM, topk_ids.numel(), a.stride(0), a.stride(1), b.stride(0), b.stride(2), b.stride(1),
         c.stride(1), c.stride(2), a_scale.stride(0) if a_scale is not None and a_scale.ndim == 2 else 0,
         a_scale.stride(1) if a_scale is not None and a_scale.ndim == 2 else 0,
         b_scale.stride(0) if b_scale is not None and b_scale.ndim >= 2 else 0,
@@ -507,10 +521,11 @@ def input_helper(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool
         a = torch.randn((M, K), dtype=dtype, device='cuda')
         a = a.to(torch.float8_e4m3fnuz)
         if int4:
-            #b = torch.randint(0, 1000000, (E, N, K // 8), dtype=torch.int32, device='cuda')
-            b = torch.randint(0, 255, (E, N, K // 2), dtype=torch.int32, device='cuda')
+            #b = torch.randint(0, 1000000, (E, N, K // 8), dtype=torch.int32, device='cuda') #block it for new 2INT4-> INT8 packing
+            b = torch.randint(0, 1000000, (E, N, K // 2), dtype=torch.int32, device='cuda') #################################################
             b = b.to(dtype=torch.int8)
-            print(b)
+            #b = torch.randint(0, 1000000, (E, N, K // 2), dtype=torch.int8, device='cuda') #RuntimeError: to - 1 is out of bounds for signed char, need to generate int32 and then convert to int8
+            #print(b)
         else:
             b = torch.rand((E, N, K), dtype=dtype, device='cuda')
             b = b.to(torch.float8_e4m3fnuz)
