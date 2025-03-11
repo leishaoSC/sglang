@@ -32,42 +32,43 @@ enable_moe_align_block_size_triton = bool(
     int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
 )
 
-@triton.jit
-def int4_to_fp8_dequant(
-        qweights,  # quantized matrix, K/8 x N
-        scales,  # scales, per channel (N,)
-        K8: tl.constexpr, #K/8
-        N: tl.constexpr
-):
-    #tl.device_print("in_qweights", qweights)
-    qweights = qweights.trans(1,0) #(N,K8)
-    qweights = tl.interleave(qweights, qweights)
-    qweights = tl.interleave(qweights, qweights)
-    weights = tl.interleave(qweights, qweights).trans(1,0) #(K,N)
+# @triton.jit
+# def int4_to_fp8_dequant(
+#         qweights,  # quantized matrix, K/8 x N
+#         scales,  # scales, per channel (N,)
+#         K8: tl.constexpr, #K/8
+#         N: tl.constexpr
+# ):
+#     #tl.device_print("in_qweights", qweights)
+#     qweights = qweights.trans(1,0) #(N,K8)
+#     qweights = tl.interleave(qweights, qweights)
+#     qweights = tl.interleave(qweights, qweights)
+#     weights = tl.interleave(qweights, qweights).trans(1,0) #(K,N)
 
-    reverse_order_tensor = ((tl.arange(0, 2) * 4)[None, :] +
-                                tl.arange(0, 4)[:, None]).reshape(8)
+#     reverse_order_tensor = ((tl.arange(0, 2) * 4)[None, :] +
+#                                 tl.arange(0, 4)[:, None]).reshape(8)
 
-    # Use this to compute a set of shifts that can be used to unpack and
-    # reorder the values in weights
-    shifts = reverse_order_tensor * 4
-    shifts = tl.broadcast_to(shifts[None, :], (K8*N, 8)) #(K8*N,8)
-    shifts = tl.reshape(shifts, (N, K8*8)).trans(1,0) #(K,N)
-    #tl.device_print("shifts", shifts)
+#     # Use this to compute a set of shifts that can be used to unpack and
+#     # reorder the values in weights
+#     shifts = reverse_order_tensor * 4
+#     shifts = tl.broadcast_to(shifts[None, :], (K8*N, 8)) #(K8*N,8)
+#     shifts = tl.reshape(shifts, (N, K8*8)).trans(1,0) #(K,N)
+#     #tl.device_print("shifts", shifts)
 
-    # Unpack and reorder: shift out the correct 4-bit value and mask.
-    weights = ((weights >> shifts) & 0xF) #(K,N)
-    weights = tl.where(weights >= 8, weights - 16, weights)
+#     # Unpack and reorder: shift out the correct 4-bit value and mask.
+#     weights = ((weights >> shifts) & 0xF) #(K,N)
+#     weights = tl.where(weights >= 8, weights - 16, weights)
 
-    #scales = tl.broadcast_to(scales[None, :], (K8*8,N))
-    scales = tl.broadcast_to(scales[:], (K8*8,N))
-    #tl.device_print("scales", scales)
-    dweights = weights * scales
-    dweights = dweights.to(tl.float8e4b8)
-    #tl.device_print("dweights", dweights)
+#     #scales = tl.broadcast_to(scales[None, :], (K8*8,N))
+#     scales = tl.broadcast_to(scales[:], (K8*8,N))
+#     #tl.device_print("scales", scales)
+#     dweights = weights * scales
+#     dweights = dweights.to(tl.float8e4b8)
+#     #tl.device_print("dweights", dweights)
 
-    return dweights
+#     return dweights
 
+#Here K is already multiplied by INT4 packing factor!!
 @triton.jit
 def fused_moe_kernel(
     # Pointers to matrices
@@ -174,19 +175,20 @@ def fused_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    offs_k_8 = tl.arange(0, BLOCK_SIZE_K // 8)
+
     a_ptrs = a_ptr + (
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
     )
 
     off_experts = tl.load(expert_ids_ptr + pid_m)
     if use_int4_w:
-        #load 1/8 th elements in B in the K direction
+        #load 1/2 th elements in B in the K direction for new packing (2 INT4 -> INT8)
         b_ptrs = (
             b_ptr
             + off_experts * stride_be
-            + (offs_k_8[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-        )
+             + ((offs_k[:, None] //2)  * stride_bk + offs_bn[None, :] * stride_bn)
+        ) #new packing 
+        b_shifter = (offs_k[:, None] % 2) * 4
     else:
         #load regular
         b_ptrs = (
@@ -213,7 +215,7 @@ def fused_moe_kernel(
     if use_int4_w:
         #load b int4 scale
         b_scale_int4_ptrs = (
-                    b_scale_int4_ptr + off_experts * stride_bsie + offs_bn[None, :] * stride_bsin
+                    b_scale_int4_ptr + off_experts * stride_bsie + offs_bn[None, :] * stride_bsin 
         )
         b_scale_int4 = tl.load(b_scale_int4_ptrs)
 
@@ -235,9 +237,12 @@ def fused_moe_kernel(
             )
             #b = tl.load(b_ptrs)
             if use_int4_w:
-                #size (BLOCK_SIZE_K /8, BLOCK_SIZE_N)
                 b_int4 = tl.load(b_ptrs)
-                b = int4_to_fp8_dequant(b_int4, b_scale_int4, b_int4.shape[0], b_int4.shape[1])
+                #new packing size (BLOCK_SIZE_K , BLOCK_SIZE_N)
+                b = (b_int4 >> b_shifter) & 0xF #extract 2 INT4s from 1 INT8
+                b = tl.where(b >= 8, b - 16, b) #handle negative values
+                b = (b * b_scale_int4).to(tl.float8e4b8)
+                #b = int4_to_fp8_dequant(b_int4, b_scale_int4, b_int4.shape[0], b_int4.shape[1])
             else:
                 b = tl.load(b_ptrs)
         else:
@@ -247,9 +252,12 @@ def fused_moe_kernel(
                 other=0.0,
             )
             if use_int4_w:
-                #size (BLOCK_SIZE_K /8, BLOCK_SIZE_N)
-                b_int4 = tl.load(b_ptrs, mask=offs_k8[:, None] < (K - k)*BLOCK_SIZE_K/8, other=0.0)
-                b = int4_to_fp8_dequant(b_int4, b_scale_int4, b_int4.shape[0], b_int4.shape[1])
+
+                b_int4 = tl.load(b_ptrs, mask=(offs_k[:, None] //2)  < (K - (k * (BLOCK_SIZE_K // 2))), other=0.0) #new packing 
+                b = (b_int4 >> b_shifter) & 0xF #extract 2 INT4s from 1 INT8
+                b = tl.where(b >= 8, b - 16, b) #handle negative values
+                b = (b * b_scale_int4).to(tl.float8e4b8)
+                #b = int4_to_fp8_dequant(b_int4, b_scale_int4, b_int4.shape[0], b_int4.shape[1])
             else:
                 b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
@@ -273,7 +281,7 @@ def fused_moe_kernel(
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         if use_int4_w:
-            b_ptrs += BLOCK_SIZE_K//8 * stride_bk
+            b_ptrs += BLOCK_SIZE_K//2 * stride_bk
         else:
             b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -570,7 +578,8 @@ def invoke_fused_moe_kernel(
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
 
-    K = (B.shape[2] - padded_size)*8
+    #K = (B.shape[2] - padded_size)*8 #for old bit packing
+    K = (B.shape[2] - padded_size)*2 # for new bit packing
     if K % config["BLOCK_SIZE_K"] == 0:
         even_Ks = True
     else:
@@ -582,6 +591,8 @@ def invoke_fused_moe_kernel(
 
     if B_scale_int4 is not None:
         use_int4_w = True
+
+    # Need (B.shape[2] - padded_size)*2 for new bit packing!!
 
     fused_moe_kernel[grid](
         A,
@@ -595,7 +606,7 @@ def invoke_fused_moe_kernel(
         expert_ids,
         num_tokens_post_padded,
         B.shape[1],
-        (B.shape[2] - padded_size)*8,
+        (B.shape[2] - padded_size)*2,
         sorted_token_ids.shape[0],
         topk_ids.numel(),
         A.stride(0),
