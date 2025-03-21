@@ -549,6 +549,7 @@ def invoke_fused_moe_kernel(
     compute_type: tl.dtype,
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int4_fp8: bool,
     block_shape: Optional[List[int]] = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
@@ -589,7 +590,7 @@ def invoke_fused_moe_kernel(
     #use_int4_w = False
     #B_scale_int4 = torch.zeros((B.shape[1], B.shape[2])) # (E,N)
 
-    if B_scale_int4 is not None:
+    if B_scale_int4 is not None or use_int4_fp8:
         use_int4_w = True
 
     # Need (B.shape[2] - padded_size)*2 for new bit packing!!
@@ -803,6 +804,7 @@ def inplace_fused_experts(
     topk_ids: torch.Tensor,
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int4_fp8: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
@@ -820,6 +822,7 @@ def inplace_fused_experts(
         True,
         use_fp8_w8a8,
         use_int8_w8a16,
+        use_int4_fp8,
         w1_scale,
         w2_scale,
         a1_scale,
@@ -838,6 +841,7 @@ def inplace_fused_experts_fake(
     topk_ids: torch.Tensor,
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int4_fp8: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
@@ -865,6 +869,7 @@ def outplace_fused_experts(
     topk_ids: torch.Tensor,
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int4_fp8: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
@@ -882,6 +887,7 @@ def outplace_fused_experts(
         False,
         use_fp8_w8a8,
         use_int8_w8a16,
+        use_int4_fp8,
         w1_scale,
         w2_scale,
         a1_scale,
@@ -900,6 +906,7 @@ def outplace_fused_experts_fake(
     topk_ids: torch.Tensor,
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int4_fp8: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
@@ -928,6 +935,7 @@ def fused_experts(
     inplace: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int4_fp8: bool = False, ###############
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
@@ -945,6 +953,7 @@ def fused_experts(
             topk_ids,
             use_fp8_w8a8,
             use_int8_w8a16,
+            use_int4_fp8,###########
             w1_scale,
             w2_scale,
             a1_scale,
@@ -963,6 +972,7 @@ def fused_experts(
             topk_ids,
             use_fp8_w8a8,
             use_int8_w8a16,
+            use_int4_fp8,#############
             w1_scale,
             w2_scale,
             a1_scale,
@@ -982,6 +992,7 @@ def fused_experts_impl(
     inplace: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int4_fp8: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
@@ -993,9 +1004,10 @@ def fused_experts_impl(
     padded_size = padding_size
     if not use_fp8_w8a8 or block_shape is not None:
         padded_size = 0
-
+    #print("hidden_states.shape=", hidden_states.shape, "dtype of hidden_states=", hidden_states.dtype, "w1.shape=", w1.shape, "dtype of w1=", w1.dtype, "w2.shape=", w2.shape)
     # Check constraints.
-    assert hidden_states.shape[1] == ((w1.shape[2] - padded_size)*8), "Hidden size mismatch"
+    assert hidden_states.shape[1] == ((w1.shape[2] - padded_size)*2), "Hidden size mismatch"
+    #assert hidden_states.shape[1] == ((w1.shape[2] - padded_size)*8), "Hidden size mismatch"  #old packing
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -1017,7 +1029,7 @@ def fused_experts_impl(
     get_config_func = functools.partial(
         try_get_optimal_moe_config,
         w1.shape,
-        (w2.shape[0], w2.shape[1], (w2.shape[2] - padded_size)*8 ),
+        (w2.shape[0], w2.shape[1], (w2.shape[2] - padded_size)*8 ),#????
         topk_ids.shape[1],
         config_dtype,
         block_shape=block_shape,
@@ -1094,6 +1106,7 @@ def fused_experts_impl(
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
+            use_int4_fp8=use_int4_fp8,
             block_shape=block_shape,
         )
 
@@ -1117,6 +1130,7 @@ def fused_experts_impl(
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
+            use_int4_fp8=use_int4_fp8,
             block_shape=block_shape,
         )
 
@@ -1149,8 +1163,11 @@ def fused_moe(
     custom_routing_function: Optional[Callable] = None,
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int4_fp8: bool = False, ################# only used for tuning fused moe purpose!!
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
+    w1_scale_int4: Optional[torch.Tensor] = None, ################# only used for tuning fused moe purpose!!
+    w2_scale_int4: Optional[torch.Tensor] = None, ################# only used for tuning fused moe purpose!!
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
@@ -1204,7 +1221,7 @@ def fused_moe(
         num_expert_group=num_expert_group,
         custom_routing_function=custom_routing_function,
     )
-
+    kwargs = {"w1_scale1":w1_scale_int4, "w2_scale1": w2_scale_int4} if use_int4_fp8 else {} ##################
     return fused_experts(
         hidden_states,
         w1,
@@ -1214,9 +1231,11 @@ def fused_moe(
         inplace=inplace,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
+        use_int4_fp8=use_int4_fp8,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
+        **kwargs,
     )
