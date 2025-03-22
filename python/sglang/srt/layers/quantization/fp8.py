@@ -444,7 +444,7 @@ class Fp8MoEMethod:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         if self.quant_config.is_checkpoint_fp8_serialized:
-            params_dtype = torch.int32
+            params_dtype = torch.int8  #torch.int32 was for old packing, new packing uses 2 INT4-> INT8
         tp_size = get_tensor_model_parallel_world_size()
         if self.block_quant:
             block_n, block_k = (
@@ -471,7 +471,7 @@ class Fp8MoEMethod:
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts, 2 * intermediate_size, int(hidden_size/8), dtype=params_dtype
+                num_experts, 2 * intermediate_size, int(hidden_size/2), dtype=params_dtype #new packing
             ),
             requires_grad=False,
         )
@@ -480,8 +480,8 @@ class Fp8MoEMethod:
 
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts, hidden_size, int(intermediate_size/8), dtype=params_dtype
-            ),
+                num_experts, hidden_size, int(intermediate_size/2), dtype=params_dtype #new packing
+             ),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight", w2_weight)

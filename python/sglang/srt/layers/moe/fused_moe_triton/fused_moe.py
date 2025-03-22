@@ -1029,7 +1029,7 @@ def fused_experts_impl(
     get_config_func = functools.partial(
         try_get_optimal_moe_config,
         w1.shape,
-        (w2.shape[0], w2.shape[1], (w2.shape[2] - padded_size)*8 ),#????
+        (w2.shape[0], w2.shape[1], (w2.shape[2] - padded_size)*2 ),# new packing
         topk_ids.shape[1],
         config_dtype,
         block_shape=block_shape,
