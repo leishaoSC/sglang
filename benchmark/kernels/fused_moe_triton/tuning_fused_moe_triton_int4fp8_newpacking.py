@@ -5,6 +5,8 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, TypedDict
 
+from contextlib import nullcontext
+
 import ray
 import torch
 import triton
@@ -212,14 +214,13 @@ def benchmark_config(
 
 def get_rocm_configs_compute_bound() -> List[Dict[str, int]]:
     configs: List[BenchmarkConfig] = []
-    #waves_per_eu_range = 0
+    waves_per_eu_range = 0
     for num_stages in [2]:
         for block_m in [32, 64, 128, 256]:
             for block_k in [32, 64, 128, 256]:
                 for block_n in [16, 32, 64, 128, 256]:
                     for num_warps in [1, 2, 4, 8]:
                         for group_size in [1, 4, 8, 16, 32]:
-                            for waves_per_eu in [0, 1, 2, 4, 5, 8]:
                                 configs.append(
                                     {
                                         "BLOCK_SIZE_M": block_m,
@@ -228,7 +229,7 @@ def get_rocm_configs_compute_bound() -> List[Dict[str, int]]:
                                         "GROUP_SIZE_M": group_size,
                                         "num_warps": num_warps,
                                         "num_stages": num_stages,
-                                        "waves_per_eu": waves_per_eu,
+                                        "waves_per_eu": waves_per_eu_range,
                                     }
                                 )
     return configs
@@ -268,6 +269,10 @@ class BenchmarkWorker:
         torch.set_default_device("cuda")
         torch.cuda.manual_seed_all(0)
         self.seed = seed
+        # Get the device ID to allocate tensors and kernels
+        # on the respective GPU. This is required for Ray to work
+        # correctly with multi-GPU tuning on the ROCm platform.
+        self.device_id = int(ray.get_gpu_ids()[0])
 
     def benchmark(
         self,
@@ -339,30 +344,32 @@ class BenchmarkWorker:
     ) -> Dict[str, int]:
         best_config = None
         best_time = float("inf")
-        for config in tqdm(search_space):
-            try:
-                kernel_time = benchmark_config(
-                    config,
-                    num_tokens,
-                    num_experts,
-                    shard_intermediate_size,
-                    hidden_size,
-                    topk,
-                    dtype,
-                    use_fp8_w8a8,
-                    use_int8_w8a8,
-                    use_int8_w8a16,
-                    use_int4_fp8, ##############
-                    block_shape,
-                    num_iters=10,
-                )
-            except triton.runtime.autotuner.OutOfResources:
-                # Some configurations may be invalid and fail to compile.
-                continue
 
-            if kernel_time < best_time:
-                best_time = kernel_time
-                best_config = config
+        with torch.cuda.device(self.device_id)  if _is_hip_ else nullcontext():
+            for config in tqdm(search_space):
+                try:
+                    kernel_time = benchmark_config(
+                        config,
+                        num_tokens,
+                        num_experts,
+                        shard_intermediate_size,
+                        hidden_size,
+                        topk,
+                        dtype,
+                        use_fp8_w8a8,
+                        use_int8_w8a8,
+                        use_int8_w8a16,
+                        use_int4_fp8, ##############
+                        block_shape,
+                        num_iters=10,
+                    )
+                except triton.runtime.autotuner.OutOfResources:
+                    # Some configurations may be invalid and fail to compile.
+                    continue
+
+                if kernel_time < best_time:
+                    best_time = kernel_time
+                    best_config = config
         now = datetime.now()
         print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
         assert best_config is not None
@@ -422,6 +429,7 @@ def main(args: argparse.Namespace):
     print(args)
 
     config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+    print("#######################config.architectures[0]=", config.architectures[0])
     if config.architectures[0] == "DbrxForCausalLM":
         E = config.ffn_config.moe_num_experts
         topk = config.ffn_config.moe_top_k
@@ -445,18 +453,20 @@ def main(args: argparse.Namespace):
     elif config.architectures[0] in [
         "Grok1ForCausalLM",
         "Grok1ImgGen",
-        "Grok1AForCausalLM",
+        "Grok1ModelForCausalLM", 
     ]:
-        E = config.num_local_experts
+        E = config.num_experts if config.architectures[0] == "Grok1ModelForCausalLM" else config.num_local_experts
         topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
+        intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
+        print("############grok1: E=", E, "topk=", topk, "intermediate_size=", intermediate_size, "shard_intermediate_size=", shard_intermediate_size, "hidden_size=", config.hidden_size )
     else:
         # Default: Mixtral
         E = config.num_local_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
+        print("############mixtral: E=", E, "topk=", topk, "intermediate_size=", intermediate_size, "shard_intermediate_size=", shard_intermediate_size)
 
     hidden_size = config.hidden_size
     dtype = config.torch_dtype
