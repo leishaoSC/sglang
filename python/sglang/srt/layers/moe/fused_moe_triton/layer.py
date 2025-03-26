@@ -521,6 +521,11 @@ class FusedMoE(torch.nn.Module):
 
         # Case model weights
         if "weight" in weight_name:
+            if loaded_weight.dtype == torch.int32: #re-interpret the int32 tensor for new packing POC
+                new_shape = list(loaded_weight.shape)
+                new_shape[-1] *= 4 # Last dim expands 4x to fit int8 elements
+                loaded_weight = loaded_weight.view(torch.int8).view(*new_shape)
+                
             self._load_model_weight_or_group_weight_scale(
                 shard_id=shard_id,
                 shard_dim=shard_dim,
