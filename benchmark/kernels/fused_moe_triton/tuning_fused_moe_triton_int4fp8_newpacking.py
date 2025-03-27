@@ -4,7 +4,7 @@ import json
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, TypedDict
-
+import os
 from contextlib import nullcontext
 
 import ray
@@ -24,6 +24,7 @@ from sglang.srt.utils import is_hip
 
 _is_hip_ = is_hip()
 
+padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
 
 class BenchmarkConfig(TypedDict):
     BLOCK_SIZE_M: int
@@ -77,7 +78,7 @@ def benchmark_config(
             dtype=torch.int8,
         )
     elif use_int4_fp8: # new packing: 2 INT4s packed into 1 INT8
-        #hard coded w1,w2 for INT4-FP8 new packing case ( int8, //2 in the last dimension)#############################
+        #hard coded w1,w2 for INT4-FP8 new packing case ( int8, //2 in the last dimension)#############################??????
         w1 = torch.randint(
             -127,
             127,
@@ -261,6 +262,110 @@ def get_configs_compute_bound() -> List[Dict[str, int]]:
                                 )
     return configs
 
+def prune_rocm_search_space(num_tokens, shard_intermediate_size, hidden_size,
+                            search_space, is_fp16, topk):
+    N1, K1 = shard_intermediate_size, hidden_size
+    N2, K2 = hidden_size, shard_intermediate_size // 2
+    pruned_space_1 = prune_rocm_configs(num_tokens * topk, N1, K1,
+                                        search_space, is_fp16)
+    pruned_space_2 = prune_rocm_configs(num_tokens * topk, N2, K2,
+                                        search_space, is_fp16)
+    search_space = merge_unique_dicts(pruned_space_1, pruned_space_2)
+    return search_space
+
+
+# The following code is inspired by ROCm/Triton GEMM tuning script:
+# https://github.com/ROCm/triton/blob/triton-mlir/scripts/amd/gemm/tune_gemm.py#L89
+def prune_rocm_configs(M, N, K, configs, is_fp16=True):
+    pruned_configs = []
+    elemBytes_a = 2 if is_fp16 else 1
+    elemBytes_b = 2 if is_fp16 else 1
+
+    mfma = 16 if M < 32 or N < 32 else 32
+
+    # TODO (zhanglx): figure out the boundary between large and small gemms
+    large_gemm = False
+    if M >= 2048 and N >= 2048:
+        large_gemm = True
+
+    for config in configs:
+        BLOCK_SIZE_M = config.get("BLOCK_SIZE_M")
+        BLOCK_SIZE_N = config.get("BLOCK_SIZE_N")
+        BLOCK_SIZE_K = config.get("BLOCK_SIZE_K")
+        num_warps = config.get("num_warps")
+
+        if is_fp16:
+            matrix_instr_nonkdim = config.get("matrix_instr_nonkdim")
+            if matrix_instr_nonkdim > mfma:
+                continue
+        if mfma == 4 and BLOCK_SIZE_K < 64:
+            continue
+        # some layouts could not work properly in case
+        # number elements per thread is less 1
+        if BLOCK_SIZE_M * BLOCK_SIZE_N < 64:
+            continue
+        SPLIT_K = 1 #config.get("SPLIT_K", 1)
+        GROUP_M = config.get("GROUP_SIZE_M")
+        if is_fp16:
+            if (matrix_instr_nonkdim > BLOCK_SIZE_M
+                    or matrix_instr_nonkdim > BLOCK_SIZE_N):
+                continue
+            if (matrix_instr_nonkdim >= M
+                    and matrix_instr_nonkdim != BLOCK_SIZE_M):
+                continue
+            if (matrix_instr_nonkdim >= N
+                    and matrix_instr_nonkdim != BLOCK_SIZE_N):
+                continue
+        # Skip BLOCK_SIZE that is too large compare to M/N
+        # unless BLOCK_SIZE is already small enough
+        if M * 2 < BLOCK_SIZE_M and BLOCK_SIZE_M != 16:
+            continue
+        if N * 2 < BLOCK_SIZE_N and BLOCK_SIZE_N != 16:
+            continue
+        # skip large split_k when not necessary
+        if SPLIT_K != 1 and not need_split_k(M, N, K):
+            continue
+        # skip split_k that leads to EVEN_K = false
+        leap = SPLIT_K * BLOCK_SIZE_K
+        modv = K % leap
+        if modv != 0:
+            continue
+        # skip large GROUP_M
+        if GROUP_M * BLOCK_SIZE_M > M and GROUP_M != 1:
+            continue
+        # out of shared memory resource
+        # TODO (zhanglx): This does not consider the LDS usage in the epilogue
+        LDS = (BLOCK_SIZE_K * BLOCK_SIZE_M * elemBytes_a +
+               BLOCK_SIZE_K * BLOCK_SIZE_N * elemBytes_b)
+        if LDS > 65536:
+            continue
+        # Skip small block sizes and num_warps for large gemm
+        # For fp16 and f8, we want to only use BLOCK_SIZE >= 64
+        if large_gemm:
+            if BLOCK_SIZE_M < 64 or BLOCK_SIZE_N < 64:
+                continue
+            if BLOCK_SIZE_K < 64:
+                continue
+            if num_warps < 4:
+                continue
+
+        pruned_configs.append(config)
+
+    return pruned_configs
+
+
+def need_split_k(SIZE_M, SIZE_N, SIZE_K):
+    return (SIZE_M < 64 or SIZE_N < 64) and SIZE_K > 1024
+
+
+def merge_unique_dicts(list1, list2):
+    result = []
+    combined_list = list1.copy()
+    combined_list.extend(list2)
+    for dictionary in combined_list:
+        if dictionary not in result:
+            result.append(dictionary)
+    return result
 
 @ray.remote(num_gpus=1)
 class BenchmarkWorker:
@@ -344,6 +449,14 @@ class BenchmarkWorker:
     ) -> Dict[str, int]:
         best_config = None
         best_time = float("inf")
+        if _is_hip_:
+            print("######################len of search space before pruning=", len(search_space))
+            is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16)
+            search_space = prune_rocm_search_space(num_tokens,
+                                                    shard_intermediate_size,
+                                                    hidden_size, search_space,
+                                                    is_fp16, topk)
+            print("######################len of search space after pruning=", len(search_space))
 
         with torch.cuda.device(self.device_id)  if _is_hip_ else nullcontext():
             for config in tqdm(search_space):
@@ -504,7 +617,7 @@ def main(args: argparse.Namespace):
         #     4096,
         # ]
         batch_sizes = [
-            4,
+            #4, #other left after pruning
             8,
             16,
             32,
@@ -525,10 +638,11 @@ def main(args: argparse.Namespace):
         batch_sizes = [args.batch_size]
 
     ray.init()
-    num_gpus = int(ray.available_resources()["GPU"])
+    num_gpus = 1 #int(ray.available_resources()["GPU"]) #force to use 1gpu, as multi-gpu ray still has load imbalance issue
     workers = [BenchmarkWorker.remote(args.seed) for _ in range(num_gpus)]
     print("#############################################num_gpus=",  num_gpus)
     print("############################################workers are", workers)
+    print("#################################################prune search space")
 
     def _distribute(method: str, inputs: List[Any]) -> List[Any]:
         outputs = []
